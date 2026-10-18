@@ -279,8 +279,16 @@ export default class RefCrumbs extends Plugin {
      */
     private hookFetchRequest() {
         this.originalFetch = window.fetch.bind(window);
-        const hooked: typeof window.fetch = (input: RequestInfo, init?: RequestInit) => {
-            const url = typeof input === "string" ? input : input.url;
+        const hooked: typeof window.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+            // fetch 也接受 URL 对象（PDF.js 就这样调用），只有 Request 与字符串才有 .url；
+            // 直接读 input.url 会拿到 undefined，随后的 .includes 抛错会让 PDF 加载失败
+            const url = typeof input === "string" ?
+                input :
+                input instanceof URL ?
+                input.href :
+                input instanceof Request ?
+                input.url :
+                "";
             if (url.includes("/api/search/searchRefBlock") && init?.body) {
                 try {
                     const body = JSON.parse(init.body as string);
