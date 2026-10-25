@@ -27,6 +27,8 @@ interface IBreadcrumb {
 
 // 每次 hint 列表里可请求的数量上限：搜索返回全部块，太多请求会阻塞
 const MAX_CONCURRENT = 4;
+// 限制长时间使用时的缓存占用；访问已有条目时提升其保留优先级
+const MAX_CACHE_SIZE = 500;
 
 // `((` 引用搜索提示面板
 const HINT_ITEM_SELECTOR = ".protyle-hint .b3-list-item";
@@ -66,10 +68,14 @@ export default class RefCrumbs extends Plugin {
     private hookedFetch: typeof window.fetch;
     private lastRefSearchNotebook = "";
     private observer: MutationObserver;
-    private crumbCache = new Map<string, string>();
+    // 缓存接口原始数据，显示配置变化时无需重新请求；键包含笔记本上下文
+    private crumbCache = new Map<string, IBreadcrumb[]>();
     private pendingIDs = new Set<string>();
     private queue: {id: string; notebook: string;}[] = [];
+    private queueHead = 0;
     private activeCount = 0;
+    private requestControllers = new Set<AbortController>();
+    private unloaded = false;
     private settings: ISettings = {...DEFAULT_SETTINGS};
 
     async onload() {
@@ -81,10 +87,19 @@ export default class RefCrumbs extends Plugin {
     }
 
     onunload() {
+        this.unloaded = true;
+        this.observer?.disconnect();
+        this.queue = [];
+        this.queueHead = 0;
+        this.pendingIDs.clear();
+        this.crumbCache.clear();
+        for (const controller of this.requestControllers) {
+            controller.abort();
+        }
+        this.requestControllers.clear();
         if (window.fetch === this.hookedFetch) {
             window.fetch = this.originalFetch;
         }
-        this.observer?.disconnect();
     }
 
     private async loadSettings() {
@@ -330,9 +345,7 @@ export default class RefCrumbs extends Plugin {
      * 插件加载时页面上可能已经存在列表（例如插件重载），初始扫描一次。
      */
     private preloadHints() {
-        document.querySelectorAll(ITEM_SELECTOR).forEach((el) => {
-            this.processItems(new Set<HTMLElement>([el as HTMLElement]));
-        });
+        this.processItems(new Set(document.querySelectorAll<HTMLElement>(ITEM_SELECTOR)));
     }
 
     /**
@@ -358,13 +371,15 @@ export default class RefCrumbs extends Plugin {
                 // “新建文件/新建子文档”等无块 id 的提示项，或资源搜索结果
                 continue;
             }
-            if (this.crumbCache.has(id)) {
-                this.paintIfMounted(item, this.crumbCache.get(id));
-                continue;
-            }
             // notebook 只对引用提示面板有意义：搜索面板的块可能来自任意笔记本，
             // 透传别的笔记本会让内核按该笔记本路由 blocktree 而查不到块。
-            this.enqueue(id, isSearchItem(item) ? "" : this.lastRefSearchNotebook);
+            const notebook = isSearchItem(item) ? "" : this.lastRefSearchNotebook;
+            const paths = this.cachedPaths(this.cacheKey(id, notebook));
+            if (paths) {
+                this.paintIfMounted(item, this.buildCrumbHTML(paths, id));
+                continue;
+            }
+            this.enqueue(id, notebook);
         }
     }
 
@@ -373,26 +388,44 @@ export default class RefCrumbs extends Plugin {
         return isSearchItem(item) ? this.settings.searchList : this.settings.refList;
     }
 
-    /**
-     * 配置变更后重画：缓存里的 HTML 由旧配置生成，必须清空；
-     * 已处理标记记在 DOM 属性上，也要显式清掉再重新处理。
-     */
+    /** 配置变更只重新生成 HTML，保留原始路径缓存，避免重复请求 */
     private repaint() {
-        this.crumbCache.clear();
-        document.querySelectorAll(ITEM_SELECTOR).forEach((el) => {
-            const item = el as HTMLElement;
+        const items = document.querySelectorAll<HTMLElement>(ITEM_SELECTOR);
+        items.forEach((item) => {
             item.querySelectorAll(`.${CRUMB_CLASS}`).forEach((crumb) => crumb.remove());
             delete item.dataset[DATASET_DONE];
             delete item.dataset[DATASET_MOUNTED];
-            this.processItems(new Set<HTMLElement>([item]));
         });
+        this.processItems(new Set(items));
+    }
+
+    private cacheKey(id: string, notebook: string) {
+        return notebook ? `${notebook}:${id}` : id;
+    }
+
+    private cachedPaths(key: string): IBreadcrumb[] | undefined {
+        const paths = this.crumbCache.get(key);
+        if (paths) {
+            this.storePaths(key, paths);
+        }
+        return paths;
+    }
+
+    private storePaths(key: string, paths: IBreadcrumb[]) {
+        // Map 的插入顺序兼作 LRU 顺序，更新已有条目不增加缓存体积
+        this.crumbCache.delete(key);
+        this.crumbCache.set(key, paths);
+        if (this.crumbCache.size > MAX_CACHE_SIZE) {
+            this.crumbCache.delete(this.crumbCache.keys().next().value);
+        }
     }
 
     private enqueue(id: string, notebook: string) {
-        if (this.crumbCache.has(id) || this.pendingIDs.has(id)) {
+        const key = this.cacheKey(id, notebook);
+        if (this.unloaded || this.crumbCache.has(key) || this.pendingIDs.has(key)) {
             return;
         }
-        this.pendingIDs.add(id);
+        this.pendingIDs.add(key);
         this.queue.push({id, notebook});
         this.pump();
     }
@@ -401,24 +434,37 @@ export default class RefCrumbs extends Plugin {
      * 并发池：同一时间最多发 MAX_CONCURRENT 个面包屑请求，避免大量文档树加载阻塞。
      */
     private pump() {
-        while (this.activeCount < MAX_CONCURRENT && this.queue.length > 0) {
-            const {id, notebook} = this.queue.shift();
+        while (!this.unloaded && this.activeCount < MAX_CONCURRENT && this.queueHead < this.queue.length) {
+            const {id, notebook} = this.queue[this.queueHead++];
+            if (this.queueHead === this.queue.length) {
+                this.queue = [];
+                this.queueHead = 0;
+            }
             this.activeCount++;
-            this.fetchBreadcrumb(id, notebook).then((html) => {
-                this.crumbCache.set(id, html);
-                this.paintById(id);
-            }).catch((_err) => {
+            const key = this.cacheKey(id, notebook);
+            const controller = new AbortController();
+            this.requestControllers.add(controller);
+            this.fetchBreadcrumb(id, notebook, controller.signal).then((paths) => {
+                this.storePaths(key, paths);
+                this.paintById(id, notebook, paths);
+            }).catch((error) => {
+                if (error?.name === "AbortError") {
+                    return;
+                }
                 // 请求失败（如拉取/网络异常）时仅缓存空值，不阻塞后续
-                this.crumbCache.set(id, "");
+                this.storePaths(key, []);
             }).finally(() => {
-                this.pendingIDs.delete(id);
+                this.requestControllers.delete(controller);
+                this.pendingIDs.delete(key);
                 this.activeCount--;
-                this.pump();
+                if (!this.unloaded) {
+                    this.pump();
+                }
             });
         }
     }
 
-    private async fetchBreadcrumb(id: string, notebook: string): Promise<string> {
+    private async fetchBreadcrumb(id: string, notebook: string, signal: AbortSignal): Promise<IBreadcrumb[]> {
         const param: Record<string, unknown> = {id, excludeTypes: []};
         if (notebook) {
             param.notebook = notebook;
@@ -427,12 +473,13 @@ export default class RefCrumbs extends Plugin {
             method: "POST",
             headers: {"Content-Type": "application/json"},
             body: JSON.stringify(param),
+            signal,
         });
         const payload = await response.json();
         if (payload.code !== 0) {
             throw new Error(payload.msg || `getBlockBreadcrumb failed: ${id}`);
         }
-        return this.buildCrumbHTML(payload.data || [], id);
+        return payload.data || [];
     }
 
     /**
@@ -487,21 +534,23 @@ export default class RefCrumbs extends Plugin {
     }
 
     /**
-     * 面包屑响应回来后，把标题链渲染到当前存在的列表项上。
-     * 列表每次输入都会被整体重写（innerHTML 重建），因此以 id 重新定位元素，
-     * 并校验元素仍然连接且尚未渲染。
+     * 面包屑响应回来后，直接按 id 定位相关列表项，避免每个响应都遍历全部搜索结果。
+     * 列表每次输入都会被整体重写（innerHTML 重建），不缓存已卸载的 DOM 节点。
      */
-    private paintById(id: string) {
-        const html = this.crumbCache.get(id);
-        if (html === undefined || html === "") {
+    private paintById(id: string, notebook: string, paths: IBreadcrumb[]) {
+        if (paths.length === 0) {
             return;
         }
-        document.querySelectorAll(ITEM_SELECTOR).forEach((el) => {
-            const item = el as HTMLElement;
-            if (this.itemID(item) === id) {
-                this.paintIfMounted(item, html);
+        const html = this.buildCrumbHTML(paths, id);
+        const items = new Set<HTMLElement>();
+        document.querySelectorAll<HTMLElement>(`[data-node-id="${CSS.escape(id)}"]`).forEach((element) => {
+            // 搜索项的 id 在自身，引用项的 id 在子元素；文档中同 id 的块不属于目标列表
+            const item = element.matches(SEARCH_ITEM_SELECTOR) ? element : element.closest(HINT_ITEM_SELECTOR);
+            if (item instanceof HTMLElement) {
+                items.add(item);
             }
         });
+        items.forEach((item) => this.paintIfMounted(item, html));
     }
 
     /**
